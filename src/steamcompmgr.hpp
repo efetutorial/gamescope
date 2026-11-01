@@ -104,6 +104,9 @@ public:
 private:
 
 	bool getTexture();
+	bool getWaylandTexture();
+	bool m_bWaylandImage = false;
+	uint64_t m_ulWaylandSerial = 0;
 
 	void updateCursorFeedback( bool bForce = false );
 

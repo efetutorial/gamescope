@@ -1,3 +1,8 @@
+> **Fork: native Wayland cursors (Gamescope 3.17.0).** Adds SHM cursor images,
+> movement, hotspots and hide/show handling for `--expose-wayland` clients.
+> See [setup, limitations and regression test](docs/native-wayland-cursor.md).
+> Steam Overlay input is a separate [companion fix](https://github.com/efetutorial/ge-steam-overlay-wayland/tree/fix/gamescope-overlay-input).
+
 ## gamescope: the micro-compositor formerly known as steamcompmgr
 
 In an embedded session usecase, gamescope does the same thing as steamcompmgr, but with less extra copies and latency:

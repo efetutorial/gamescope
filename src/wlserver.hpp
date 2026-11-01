@@ -111,6 +111,14 @@ private:
 	std::vector<ResListEntry_t> wayland_commit_queue;
 };
 
+// Protected by the wlserver lock; pixels are copied before client buffers release.
+struct wlserver_cursor_image {
+	uint64_t serial = 1;
+	int width = 0, height = 0;
+	int hotspot_x = 0, hotspot_y = 0;
+	std::vector<uint32_t> pixels;
+};
+
 struct wlserver_t {
 	struct wl_display *display;
 	struct wl_event_loop *event_loop;
@@ -135,6 +143,7 @@ struct wlserver_t {
 		std::vector<std::unique_ptr<gamescope_xwayland_server_t>> xwayland_servers;
 	} wlr;
 	
+	wlserver_cursor_image cursor_image;
 	struct wlr_surface *mouse_focus_surface;
 	struct wlr_surface *kb_focus_surface;
 	std::unordered_map<struct wlr_surface *, std::pair<int, int>> current_dropdown_surfaces;
@@ -339,3 +348,8 @@ bool wlsession_active();
 void wlserver_fake_mouse_pos( double x, double y );
 
 void wlserver_mousewheel2( int32_t nDiscreteX, int32_t nDiscreteY, double flX, double flY, uint32_t uTime );
+
+extern std::atomic<bool> g_native_cursor_debug;
+
+// Caller must hold the wlserver lock. Returns logical surface coordinates.
+std::pair<int, int> wlserver_get_surface_extent(struct wlr_surface *surface);

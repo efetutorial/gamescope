@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <xf86drm.h>
+#include <drm_fourcc.h>
 #include <sys/eventfd.h>
 
 #include <linux/input-event-codes.h>
@@ -33,6 +34,7 @@
 #include <wlr/interfaces/wlr_keyboard.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_keyboard_group.h>
 #include <wlr/types/wlr_pointer.h>
@@ -110,6 +112,137 @@ static std::atomic<bool> g_bShutdownWLServer{ false };
 
 static void wlserver_x11_surface_info_set_wlr( struct wlserver_x11_surface_info *surf, struct wlr_surface *wlr_surf, bool override );
 wlserver_wl_surface_info *get_wl_surface_info(struct wlr_surface *wlr_surf);
+
+extern std::atomic<bool> hasCursorRepaint;
+
+std::atomic<bool> g_native_cursor_debug{false};
+static gamescope::ConCommand cc_native_cursor_debug("native_cursor_debug", "Toggle native cursor diagnostics",
+	[](std::span<std::string_view> args) {
+		g_native_cursor_debug = args.size() > 1 && args[1] == "1";
+	});
+static gamescope::ConCommand cc_native_cursor_warp("native_cursor_warp", "Debug-only native cursor motion test (x,y)",
+	[](std::span<std::string_view> args) {
+		if (!getenv("GAMESCOPE_DEBUG_NATIVE_CURSOR") || args.size() < 2) return;
+		double x, y;
+		if (sscanf(std::string(args[1]).c_str(), "%lf,%lf", &x, &y) == 2)
+			wlserver_mousewarp(x, y, 1, false);
+	});
+
+static struct wlr_surface *s_cursor_surface = nullptr;
+static struct wl_listener s_cursor_commit = {}, s_cursor_destroy = {};
+static struct wl_listener s_request_cursor = {}, s_cursor_focus = {}, s_cursor_seat_destroy = {};
+
+static void cursor_image_changed()
+{
+	++wlserver.cursor_image.serial;
+	hasCursorRepaint = true;
+	nudge_steamcompmgr();
+}
+
+static void cursor_read_surface()
+{
+	auto &image = wlserver.cursor_image;
+	image.width = image.height = 0;
+	image.pixels.clear();
+	if (s_cursor_surface && s_cursor_surface->buffer && s_cursor_surface->buffer->source)
+	{
+		auto *buffer = s_cursor_surface->buffer->source;
+		void *data = nullptr;
+		uint32_t format = 0;
+		size_t stride = 0;
+		const int width = s_cursor_surface->current.width;
+		const int height = s_cursor_surface->current.height;
+		if (width > 0 && height > 0 && width <= 1024 && height <= 1024 &&
+			s_cursor_surface->current.transform == WL_OUTPUT_TRANSFORM_NORMAL &&
+			wlr_buffer_begin_data_ptr_access(buffer, WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &format, &stride))
+		{
+			if (format == DRM_FORMAT_ARGB8888 || format == DRM_FORMAT_XRGB8888 ||
+				format == DRM_FORMAT_ABGR8888 || format == DRM_FORMAT_XBGR8888)
+			{
+				image.width = width;
+				image.height = height;
+				image.pixels.resize(size_t(width) * height);
+				for (int y = 0; y < height; ++y)
+				{
+					const auto *row = reinterpret_cast<const uint8_t *>(data) +
+						size_t(y * buffer->height / height) * stride;
+					for (int x = 0; x < width; ++x)
+					{
+						uint32_t pixel;
+						memcpy(&pixel, row + size_t(x * buffer->width / width) * 4, 4);
+						if (format == DRM_FORMAT_ABGR8888 || format == DRM_FORMAT_XBGR8888)
+							pixel = (pixel & 0xff00ff00) | ((pixel & 0xff) << 16) | ((pixel >> 16) & 0xff);
+						if (format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_XBGR8888)
+							pixel |= 0xff000000;
+						image.pixels[size_t(y) * width + x] = pixel;
+					}
+				}
+			}
+			else
+				wl_log.errorf("Unsupported native cursor buffer format: %u", format);
+			wlr_buffer_end_data_ptr_access(buffer);
+		}
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		wlr_surface_send_frame_done(s_cursor_surface, &now);
+	}
+	cursor_image_changed();
+}
+
+static void cursor_detach_surface()
+{
+	if (!s_cursor_surface)
+		return;
+	wl_list_remove(&s_cursor_commit.link);
+	wl_list_remove(&s_cursor_destroy.link);
+	s_cursor_surface = nullptr;
+}
+
+static void cursor_surface_commit(struct wl_listener *, void *)
+{
+	cursor_read_surface();
+}
+
+static void cursor_surface_destroy(struct wl_listener *, void *)
+{
+	cursor_detach_surface();
+	cursor_read_surface();
+}
+
+static void cursor_focus_changed(struct wl_listener *, void *)
+{
+	// A cursor belongs to the pointer focus client, never to the next app.
+	cursor_detach_surface();
+	cursor_read_surface();
+}
+
+static void cursor_seat_destroyed(struct wl_listener *, void *)
+{
+	cursor_detach_surface();
+	wl_list_remove(&s_cursor_focus.link);
+	wl_list_remove(&s_request_cursor.link);
+	wl_list_remove(&s_cursor_seat_destroy.link);
+}
+
+static void cursor_set_request(struct wl_listener *, void *data)
+{
+	auto *event = static_cast<struct wlr_seat_pointer_request_set_cursor_event *>(data);
+	if (event->seat_client != wlserver.wlr.seat->pointer_state.focused_client ||
+		!wlr_seat_client_validate_event_serial(event->seat_client, event->serial))
+		return;
+	cursor_detach_surface();
+	s_cursor_surface = event->surface;
+	wlserver.cursor_image.hotspot_x = event->hotspot_x;
+	wlserver.cursor_image.hotspot_y = event->hotspot_y;
+	if (s_cursor_surface)
+	{
+		s_cursor_commit.notify = cursor_surface_commit;
+		s_cursor_destroy.notify = cursor_surface_destroy;
+		wl_signal_add(&s_cursor_surface->events.commit, &s_cursor_commit);
+		wl_signal_add(&s_cursor_surface->events.destroy, &s_cursor_destroy);
+	}
+	cursor_read_surface();
+}
 
 static void wlserver_update_cursor_constraint();
 static void handle_pointer_constraint(struct wl_listener *listener, void *data);
@@ -2397,6 +2530,12 @@ bool wlserver_init( void ) {
 	}
 
 	wlserver.wlr.seat = wlr_seat_create(wlserver.display, "seat0");
+	s_cursor_seat_destroy.notify = cursor_seat_destroyed;
+	wl_signal_add(&wlserver.wlr.seat->events.destroy, &s_cursor_seat_destroy);
+	s_request_cursor.notify = cursor_set_request;
+	wl_signal_add(&wlserver.wlr.seat->events.request_set_cursor, &s_request_cursor);
+	s_cursor_focus.notify = cursor_focus_changed;
+	wl_signal_add(&wlserver.wlr.seat->pointer_state.events.focus_change, &s_cursor_focus);
 	wlr_seat_set_capabilities( wlserver.wlr.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_TOUCH );
 
 	wl_log.infof("Running compositor on wayland display '%s'", wlserver.wl_display_name);

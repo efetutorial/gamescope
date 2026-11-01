@@ -2021,7 +2021,22 @@ void MouseCursor::UpdatePosition()
 	wlserver_lock();
 	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
 	m_bConstrained = !!pConstraint;
-	if ( pConstraint && pConstraint->current.cursor_hint.enabled )
+	if (m_bWaylandImage && (g_native_cursor_debug.load() || getenv("GAMESCOPE_DEBUG_NATIVE_CURSOR")))
+	{
+		static uint64_t lastLog = 0;
+		const uint64_t now = get_time_in_nanos();
+		if (now - lastLog > 1000000000ULL)
+		{
+			xwm_log.infof("Native cursor position: %.1f,%.1f constraint=%d hint=%d %.1f,%.1f",
+				wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory,
+				pConstraint ? int(pConstraint->type) : -1,
+				pConstraint ? int(pConstraint->current.cursor_hint.enabled) : 0,
+				pConstraint ? pConstraint->current.cursor_hint.x : 0.0,
+				pConstraint ? pConstraint->current.cursor_hint.y : 0.0);
+			lastLog = now;
+		}
+	}
+	if ( !m_bWaylandImage && pConstraint && pConstraint->current.cursor_hint.enabled )
 	{
 		m_x = pConstraint->current.cursor_hint.x;
 		m_y = pConstraint->current.cursor_hint.y;
@@ -2180,8 +2195,89 @@ int MouseCursor::y() const
 	return m_y;
 }
 
+bool MouseCursor::getWaylandTexture()
+{
+	wlserver_cursor_image image;
+	wlserver_lock();
+	if (m_bWaylandImage && m_ulWaylandSerial == wlserver.cursor_image.serial && !m_dirty)
+	{
+		wlserver_unlock();
+		return !m_imageEmpty;
+	}
+	image = wlserver.cursor_image;
+	wlserver_unlock();
+
+	if ((g_native_cursor_debug.load() || getenv("GAMESCOPE_DEBUG_NATIVE_CURSOR")))
+		xwm_log.infof("Native cursor serial %lu: %dx%d, hotspot %d,%d", image.serial,
+			image.width, image.height, image.hotspot_x, image.hotspot_y);
+	m_bWaylandImage = true;
+	m_ulWaylandSerial = image.serial;
+	m_hotspotX = image.hotspot_x;
+	m_hotspotY = image.hotspot_y;
+	m_dirty = false;
+	m_texture = nullptr;
+	m_imageEmpty = image.pixels.empty() || std::none_of(image.pixels.begin(), image.pixels.end(),
+		[](uint32_t pixel) { return pixel & 0xff000000; });
+
+	auto *connector = GetBackend()->GetCurrentMouseConnector();
+	auto *hints = connector ? connector->GetNestedHints() : nullptr;
+	if (m_imageEmpty)
+	{
+		if (hints) hints->SetCursorImage(nullptr);
+		updateCursorFeedback();
+		return false;
+	}
+
+	auto size = GetBackend()->CursorSurfaceSize(glm::uvec2(image.width, image.height));
+	if (size.x < uint32_t(image.width) || size.y < uint32_t(image.height))
+	{
+		m_imageEmpty = true;
+		if (hints) hints->SetCursorImage(nullptr);
+		return false;
+	}
+	std::vector<uint32_t> pixels(size_t(size.x) * size.y);
+	for (int y = 0; y < image.height; ++y)
+		std::copy_n(image.pixels.data() + size_t(y) * image.width, image.width,
+					pixels.data() + size_t(y) * size.x);
+
+	CVulkanTexture::createFlags flags;
+	flags.bFlippable = true;
+	flags.bLinear = GetBackend()->SupportsPlaneHardwareCursor();
+	m_texture = vulkan_create_texture_from_bits(size.x, size.y, image.width, image.height,
+		DRM_FORMAT_ARGB8888, flags, pixels.data());
+	if (!m_texture)
+	{
+		m_imageEmpty = true;
+		if (hints) hints->SetCursorImage(nullptr);
+		return false;
+	}
+	if (hints)
+	{
+		auto info = std::make_shared<gamescope::INestedHints::CursorInfo>(
+			gamescope::INestedHints::CursorInfo {
+				.pPixels = std::move(pixels),
+				.uWidth = uint32_t(image.width),
+				.uHeight = uint32_t(image.height),
+				.uXHotspot = uint32_t(std::max(image.hotspot_x, 0)),
+				.uYHotspot = uint32_t(std::max(image.hotspot_y, 0)),
+			});
+		hints->SetCursorImage(std::move(info));
+	}
+	updateCursorFeedback();
+	return true;
+}
+
 bool MouseCursor::getTexture()
 {
+	auto *focus = GetCurrentMouseFocus();
+	if (focus && focus->cursor == this && focus->inputFocusWindow &&
+		focus->inputFocusWindow->type != steamcompmgr_win_type_t::XWAYLAND)
+		return getWaylandTexture();
+	if (m_bWaylandImage)
+	{
+		m_bWaylandImage = false;
+		m_dirty = true;
+	}
 	uint64_t ulConnectorId = 0;
 	if ( GetBackend()->GetCurrentConnector() )
 		ulConnectorId = GetBackend()->GetCurrentConnector()->GetConnectorID();
@@ -2380,6 +2476,19 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 
 	int32_t sourceWidth = window->GetGeometry().nWidth;
 	int32_t sourceHeight = window->GetGeometry().nHeight;
+	if (m_bWaylandImage)
+	{
+		// XDG window geometry is not populated on this path. Match the logical
+		// surface coordinates used by wlserver_mousemotion/warp instead.
+		wlserver_lock();
+		auto extent = wlserver_get_surface_extent(window->main_surface());
+		wlserver_unlock();
+		sourceWidth = extent.first;
+		sourceHeight = extent.second;
+	}
+	if (sourceWidth <= 0 || sourceHeight <= 0)
+		return;
+
 
 	if ( fit )
 	{
@@ -2410,7 +2519,7 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 	// Actual point on scaled screen where the cursor hotspot should be.
 	// Compositing ignores the focused window's X11 origin, so the cursor
 	// must also ignore it to stay consistent with the composited output.
-	bool isFocusWindow = (window == m_ctx->focus.focusWindow);
+	bool isFocusWindow = m_bWaylandImage || (window == m_ctx->focus.focusWindow);
 	int32_t winOriginX = isFocusWindow ? 0 : window->GetGeometry().nX;
 	int32_t winOriginY = isFocusWindow ? 0 : window->GetGeometry().nY;
 	scaledX = (winX - winOriginX) * currentScaleRatio_x + cursorOffsetX;
@@ -2423,7 +2532,7 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 	}
 
 	bool bNested = GetBackend()->GetCurrentMouseConnector() && GetBackend()->GetCurrentMouseConnector()->GetNestedHints();
-	if ( !bNested )
+	if ( !bNested || (m_bWaylandImage && ShouldDrawCursor()) )
 	{
 		// Apply the cursor offset inside the texture using the display scale
 		scaledX = scaledX - (m_hotspotX * cursor_scale);
@@ -2441,6 +2550,18 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
 
 	layer->offset.x = -scaledX;
 	layer->offset.y = -scaledY;
+	if (m_bWaylandImage && g_native_cursor_debug.load())
+	{
+		static uint64_t lastLog = 0;
+		auto now = get_time_in_nanos();
+		if (now - lastLog > 500000000ULL)
+		{
+			xwm_log.infof("Native cursor draw: cached=%d,%d scaled=%.1f,%.1f window=%d,%d %dx%d hidden=%d empty=%d",
+				winX,winY,scaledX,scaledY,window->GetGeometry().nX,window->GetGeometry().nY,
+				sourceWidth,sourceHeight,int(wlserver.bCursorHidden),int(m_imageEmpty));
+			lastLog=now;
+		}
+	}
 
 	layer->zpos = g_zposCursor; // cursor, on top of both bottom layers
 	layer->applyColorMgmt = false;
@@ -5307,17 +5428,7 @@ determine_and_apply_focus( global_focus_t *pFocus )
 			pFocus->cursor = pFocus->inputFocusWindow->xwayland().ctx->cursor.get();
 		else
 		{
-			// TODO XDG:
-			// Implement cursor support.
-			// Probably want some form of abstraction here for
-			// wl cursor vs x11 cursor given we have virtual cursors.
-			// wlserver should update wl cursor pos xy directly.
-			static bool s_once = false;
-			if (!s_once)
-			{
-				xwm_log.errorf("NO CURSOR IMPL XDG");
-				s_once = true;
-			}
+			pFocus->cursor = root_ctx->cursor.get();
 		}
 	}
 
